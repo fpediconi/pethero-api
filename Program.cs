@@ -3,10 +3,20 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Text;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Http;
+using Microsoft.IdentityModel.Tokens;
 using Microsoft.EntityFrameworkCore;
 using PetHero.Api.Data;
 using PetHero.Api.Dtos;
 using PetHero.Api.Entities;
+using PetHero.Api.Configuration;
+using PetHero.Api.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -42,6 +52,33 @@ builder.Services.AddDbContext<PetHeroDbContext>(options =>
     options.UseSqlite(builder.Configuration.GetConnectionString("Default") ?? "Data Source=pethero.db");
 });
 
+var jwtOptions = new JwtOptions();
+builder.Configuration.GetSection(JwtOptions.SectionName).Bind(jwtOptions);
+
+builder.Services.Configure<JwtOptions>(builder.Configuration.GetSection(JwtOptions.SectionName));
+builder.Services.AddSingleton<ITokenService, JwtTokenService>();
+
+builder.Services.AddAuthentication(options =>
+{
+    options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+    options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+}).AddJwtBearer(options =>
+{
+    options.TokenValidationParameters = new TokenValidationParameters
+    {
+        ValidateIssuer = true,
+        ValidateAudience = false,
+        ValidateIssuerSigningKey = true,
+        ValidIssuer = jwtOptions.Issuer,
+        ValidAudience = jwtOptions.Audience,
+        IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtOptions.Key)),
+        ClockSkew = TimeSpan.Zero
+    };
+});
+
+builder.Services.AddAuthorization();
+
+
 var app = builder.Build();
 
 using (var scope = app.Services.CreateScope())
@@ -59,7 +96,176 @@ if (app.Environment.IsDevelopment())
 
 app.UseCors("spa");
 
+app.UseAuthentication();
+app.UseAuthorization();
+
 app.MapGet("/", () => Results.Json(new { message = "PetHero API ready" }));
+
+var auth = app.MapGroup("/auth").WithTags("Auth");
+
+auth.MapPost("/register", async (RegisterRequestDto payload, PetHeroDbContext db, ITokenService tokenService, CancellationToken cancellationToken) =>
+{
+    if (payload is null)
+    {
+        return Results.BadRequest(new { message = "Invalid body" });
+    }
+
+    if (string.IsNullOrWhiteSpace(payload.Email) ||
+        string.IsNullOrWhiteSpace(payload.Password) ||
+        string.IsNullOrWhiteSpace(payload.Role))
+    {
+        return Results.BadRequest(new { message = "email, password and role are required" });
+    }
+
+    var email = payload.Email.Trim().ToLowerInvariant();
+    var role = payload.Role.Trim().ToLowerInvariant();
+
+    if (role != "owner" && role != "guardian")
+    {
+        return Results.BadRequest(new { message = "Role must be owner or guardian" });
+    }
+
+    var exists = await db.Users.AnyAsync(u => u.Email == email, cancellationToken);
+    if (exists)
+    {
+        return Results.Conflict(new { message = "Email already registered" });
+    }
+
+    var user = new User
+    {
+        Email = email,
+        Password = payload.Password,
+        Role = role,
+        IsLoggedIn = false,
+        CreatedAt = DateTime.UtcNow.ToString("o")
+    };
+
+    await db.Users.AddAsync(user, cancellationToken);
+    await db.SaveChangesAsync(cancellationToken);
+
+    if (payload.Profile is not null)
+    {
+        var displayName = string.IsNullOrWhiteSpace(payload.Profile.DisplayName)
+            ? email
+            : payload.Profile.DisplayName.Trim();
+
+        var profile = new Profile
+        {
+            UserId = user.Id,
+            DisplayName = string.IsNullOrWhiteSpace(displayName) ? email : displayName,
+            Phone = payload.Profile.Phone,
+            Location = payload.Profile.Location,
+            Bio = payload.Profile.Bio,
+            AvatarUrl = payload.Profile.AvatarUrl
+        };
+
+        await db.Profiles.AddAsync(profile, cancellationToken);
+        await db.SaveChangesAsync(cancellationToken);
+
+        user.ProfileId = profile.Id;
+        await db.SaveChangesAsync(cancellationToken);
+    }
+
+    var authUser = await BuildAuthenticatedUserDtoAsync(user, db, cancellationToken);
+    var token = tokenService.GenerateToken(user);
+
+    var response = new AuthResponseDto
+    {
+        Token = token,
+        User = authUser
+    };
+
+    return Results.Ok(response);
+});
+
+auth.MapPost("/login", async (LoginRequestDto payload, PetHeroDbContext db, ITokenService tokenService, CancellationToken cancellationToken) =>
+{
+    if (payload is null)
+    {
+        return Results.BadRequest(new { message = "Invalid body" });
+    }
+
+    if (string.IsNullOrWhiteSpace(payload.Email) || string.IsNullOrWhiteSpace(payload.Password))
+    {
+        return Results.BadRequest(new { message = "email and password are required" });
+    }
+
+    var email = payload.Email.Trim().ToLowerInvariant();
+    var user = await db.Users.FirstOrDefaultAsync(u => u.Email == email, cancellationToken);
+
+    bool passwordOk = false;
+    var stateChanged = false;
+
+    if (user is not null && !string.IsNullOrWhiteSpace(user.Password))
+    {
+        // Si ya esta hasheada (BCrypt empieza con "$2")
+        if (user.Password.StartsWith("$2"))
+        {
+            passwordOk = BCrypt.Net.BCrypt.Verify(payload.Password, user.Password);
+        }
+        else
+        {
+            // Compatibilidad hacia atras (texto plano); si matchea, re-hasheamos para endurecer
+            if (string.Equals(user.Password, payload.Password, StringComparison.Ordinal))
+            {
+                user.Password = BCrypt.Net.BCrypt.HashPassword(payload.Password);
+                passwordOk = true;
+                stateChanged = true;
+            }
+        }
+    }
+
+    if (user is null || !passwordOk)
+    {
+        return Results.Unauthorized();
+    }
+
+    if (user.IsLoggedIn)
+    {
+        return Results.Conflict(new { message = "User already has an active session" });
+    }
+
+    user.IsLoggedIn = true;
+    stateChanged = true;
+
+    if (stateChanged)
+    {
+        await db.SaveChangesAsync(cancellationToken);
+    }
+
+    var authUser = await BuildAuthenticatedUserDtoAsync(user, db, cancellationToken);
+    var token = tokenService.GenerateToken(user);
+
+    var response = new AuthResponseDto
+    {
+        Token = token,
+        User = authUser
+    };
+
+    return Results.Ok(response);
+});
+auth.MapPost("/logout", async (ClaimsPrincipal principal, PetHeroDbContext db, CancellationToken cancellationToken) =>
+{
+    var userId = ResolveUserId(principal);
+    if (userId is null)
+    {
+        return Results.Unauthorized();
+    }
+
+    var user = await db.Users.FirstOrDefaultAsync(u => u.Id == userId.Value, cancellationToken);
+    if (user is null)
+    {
+        return Results.Unauthorized();
+    }
+
+    if (user.IsLoggedIn)
+    {
+        user.IsLoggedIn = false;
+        await db.SaveChangesAsync(cancellationToken);
+    }
+
+    return Results.Ok(new { success = true });
+}).RequireAuthorization();
 
 var users = app.MapGroup("/users").WithTags("Users");
 
@@ -122,10 +328,10 @@ users.MapPost("", async (User payload, PetHeroDbContext db) =>
     var entity = new User
     {
         Email = email,
-        Password = payload.Password,
+        Password = BCrypt.Net.BCrypt.HashPassword(payload.Password),
         Role = role,
-        ProfileId = payload.ProfileId,
-        CreatedAt = string.IsNullOrWhiteSpace(payload.CreatedAt) ? DateTime.UtcNow.ToString("o") : payload.CreatedAt!
+        IsLoggedIn = false,
+        CreatedAt = DateTime.UtcNow.ToString("o")
     };
 
     db.Users.Add(entity);
@@ -376,28 +582,66 @@ availability.MapDelete("/{id}", async (string id, PetHeroDbContext db) =>
 
 app.MapGet("/availability_exceptions", (string? guardianId) =>
 {
-    // 1:1 con mock actual: json-server devolvía []
+    // 1:1 con mock actual: json-server devolvï¿½a []
     return Results.Ok(Array.Empty<object>());
 }).WithTags("Availability");
 
 var bookings = app.MapGroup("/bookings").WithTags("Bookings");
 
-bookings.MapGet("", async (string? guardianId, string? ownerId, string? status, string[]? states, PetHeroDbContext db) =>
+bookings.MapGet("", async (ClaimsPrincipal principal, string? guardianId, string? ownerId, string? status, string[]? states, PetHeroDbContext db, CancellationToken cancellationToken) =>
 {
-    // 1:1 con mock json-server: /bookings con filtros opcionales
-    var query = db.Bookings.AsNoTracking().AsQueryable();
-
-    if (!string.IsNullOrWhiteSpace(guardianId))
+    var userId = ResolveUserId(principal);
+    if (userId is null)
     {
-        query = query.Where(b => b.GuardianId == guardianId);
+        return Results.Unauthorized();
     }
 
-    if (!string.IsNullOrWhiteSpace(ownerId))
+    var role = ResolveUserRole(principal);
+    if (string.IsNullOrWhiteSpace(role))
     {
-        query = query.Where(b => b.OwnerId == ownerId);
+        return Results.Forbid();
+    }
+
+    var query = db.Bookings.AsNoTracking().AsQueryable();
+    var userIdText = userId.Value.ToString();
+
+    if (string.Equals(role, "owner", StringComparison.OrdinalIgnoreCase))
+    {
+        var effectiveOwnerId = string.IsNullOrWhiteSpace(ownerId) ? userIdText : ownerId;
+        if (!string.Equals(effectiveOwnerId, userIdText, StringComparison.Ordinal))
+        {
+            return Results.Forbid();
+        }
+
+        query = query.Where(b => b.OwnerId == userIdText);
+
+        if (!string.IsNullOrWhiteSpace(guardianId))
+        {
+            query = query.Where(b => b.GuardianId == guardianId);
+        }
+    }
+    else if (string.Equals(role, "guardian", StringComparison.OrdinalIgnoreCase))
+    {
+        var effectiveGuardianId = string.IsNullOrWhiteSpace(guardianId) ? userIdText : guardianId;
+        if (!string.Equals(effectiveGuardianId, userIdText, StringComparison.Ordinal))
+        {
+            return Results.Forbid();
+        }
+
+        query = query.Where(b => b.GuardianId == userIdText);
+
+        if (!string.IsNullOrWhiteSpace(ownerId))
+        {
+            query = query.Where(b => b.OwnerId == ownerId);
+        }
+    }
+    else
+    {
+        return Results.Forbid();
     }
 
     var statusFilters = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
     if (!string.IsNullOrWhiteSpace(status))
     {
         statusFilters.Add(status);
@@ -419,21 +663,43 @@ bookings.MapGet("", async (string? guardianId, string? ownerId, string? status, 
         query = query.Where(b => statusFilters.Contains(b.Status));
     }
 
-    var list = await query.OrderByDescending(b => b.CreatedAt).ToListAsync();
+    var list = await query.OrderByDescending(b => b.CreatedAt).ToListAsync(cancellationToken);
     return Results.Ok(list);
-});
+}).RequireAuthorization();
 
-bookings.MapGet("/{id}", async (string id, PetHeroDbContext db) =>
+bookings.MapGet("/{id}", async (string id, ClaimsPrincipal principal, PetHeroDbContext db, CancellationToken cancellationToken) =>
 {
-    var entity = await db.Bookings.AsNoTracking().FirstOrDefaultAsync(b => b.Id == id);
-    return entity is null ? Results.NotFound() : Results.Ok(entity);
-});
+    var userId = ResolveUserId(principal);
+    if (userId is null)
+    {
+        return Results.Unauthorized();
+    }
 
-bookings.MapPost("", async (BookingDto payload, PetHeroDbContext db) =>
+    var booking = await db.Bookings.AsNoTracking().FirstOrDefaultAsync(b => b.Id == id, cancellationToken);
+    if (booking is null)
+    {
+        return Results.NotFound();
+    }
+
+    if (!IsBookingAccessible(booking, userId.Value, ResolveUserRole(principal)))
+    {
+        return Results.Forbid();
+    }
+
+    return Results.Ok(booking);
+}).RequireAuthorization();
+
+bookings.MapPost("", async (BookingDto payload, ClaimsPrincipal principal, PetHeroDbContext db, CancellationToken cancellationToken) =>
 {
     if (payload is null)
     {
         return Results.BadRequest(new { message = "Invalid body" });
+    }
+
+    var userId = ResolveUserId(principal);
+    if (userId is null)
+    {
+        return Results.Unauthorized();
     }
 
     if (string.IsNullOrWhiteSpace(payload.OwnerId) ||
@@ -445,16 +711,31 @@ bookings.MapPost("", async (BookingDto payload, PetHeroDbContext db) =>
         return Results.BadRequest(new { message = "ownerId, guardianId, petId, start and end are required" });
     }
 
-    var id = string.IsNullOrWhiteSpace(payload.Id) ? Guid.NewGuid().ToString() : payload.Id!;
-    var exists = await db.Bookings.AnyAsync(b => b.Id == id);
-    if (exists)
+    var role = ResolveUserRole(principal);
+    var userIdText = userId.Value.ToString();
+
+    if (string.Equals(role, "owner", StringComparison.OrdinalIgnoreCase))
     {
-        return Results.Conflict(new { message = "Booking already exists" });
+        if (!string.Equals(payload.OwnerId, userIdText, StringComparison.Ordinal))
+        {
+            return Results.Forbid();
+        }
+    }
+    else if (string.Equals(role, "guardian", StringComparison.OrdinalIgnoreCase))
+    {
+        if (!string.Equals(payload.GuardianId, userIdText, StringComparison.Ordinal))
+        {
+            return Results.Forbid();
+        }
+    }
+    else
+    {
+        return Results.Forbid();
     }
 
-    var entity = new Booking
+    var booking = new Booking
     {
-        Id = id,
+        Id = Guid.NewGuid().ToString(),
         OwnerId = payload.OwnerId!,
         GuardianId = payload.GuardianId!,
         PetId = payload.PetId!,
@@ -463,60 +744,131 @@ bookings.MapPost("", async (BookingDto payload, PetHeroDbContext db) =>
         Status = string.IsNullOrWhiteSpace(payload.Status) ? "REQUESTED" : payload.Status!,
         DepositPaid = payload.DepositPaid ?? false,
         TotalPrice = payload.TotalPrice,
-        CreatedAt = string.IsNullOrWhiteSpace(payload.CreatedAt) ? DateTime.UtcNow.ToString("o") : payload.CreatedAt!
+        CreatedAt = DateTime.UtcNow.ToString("o")
     };
 
-    db.Bookings.Add(entity);
-    await db.SaveChangesAsync();
+    db.Bookings.Add(booking);
+    await db.SaveChangesAsync(cancellationToken);
 
-    return Results.Created($"/bookings/{entity.Id}", entity);
-});
+    return Results.Created($"/bookings/{booking.Id}", booking);
+}).RequireAuthorization();
 
-bookings.MapPut("/{id}", async (string id, BookingDto payload, PetHeroDbContext db) =>
+bookings.MapPut("/{id}", async (string id, BookingDto payload, ClaimsPrincipal principal, PetHeroDbContext db, CancellationToken cancellationToken) =>
 {
-    var entity = await db.Bookings.FirstOrDefaultAsync(b => b.Id == id);
-    if (entity is null)
+    var userId = ResolveUserId(principal);
+    if (userId is null)
+    {
+        return Results.Unauthorized();
+    }
+
+    var booking = await db.Bookings.FirstOrDefaultAsync(b => b.Id == id, cancellationToken);
+    if (booking is null)
     {
         return Results.NotFound();
     }
 
-    if (!string.IsNullOrWhiteSpace(payload.OwnerId)) entity.OwnerId = payload.OwnerId!;
-    if (!string.IsNullOrWhiteSpace(payload.GuardianId)) entity.GuardianId = payload.GuardianId!;
-    if (!string.IsNullOrWhiteSpace(payload.PetId)) entity.PetId = payload.PetId!;
-    if (!string.IsNullOrWhiteSpace(payload.Start)) entity.Start = payload.Start!;
-    if (!string.IsNullOrWhiteSpace(payload.End)) entity.End = payload.End!;
-    if (!string.IsNullOrWhiteSpace(payload.Status)) entity.Status = payload.Status!;
-    if (payload.DepositPaid.HasValue) entity.DepositPaid = payload.DepositPaid.Value;
-    if (payload.TotalPrice.HasValue) entity.TotalPrice = payload.TotalPrice;
-    if (!string.IsNullOrWhiteSpace(payload.CreatedAt)) entity.CreatedAt = payload.CreatedAt!;
+    if (!IsBookingAccessible(booking, userId.Value, ResolveUserRole(principal)))
+    {
+        return Results.Forbid();
+    }
 
-    await db.SaveChangesAsync();
+    if (!string.IsNullOrWhiteSpace(payload.OwnerId) && !string.Equals(payload.OwnerId, booking.OwnerId, StringComparison.Ordinal))
+    {
+        return Results.BadRequest(new { message = "ownerId cannot be changed" });
+    }
 
-    return Results.Ok(entity);
-});
+    if (!string.IsNullOrWhiteSpace(payload.GuardianId) && !string.Equals(payload.GuardianId, booking.GuardianId, StringComparison.Ordinal))
+    {
+        return Results.BadRequest(new { message = "guardianId cannot be changed" });
+    }
+
+    if (!string.IsNullOrWhiteSpace(payload.PetId)) booking.PetId = payload.PetId!;
+    if (!string.IsNullOrWhiteSpace(payload.Start)) booking.Start = payload.Start!;
+    if (!string.IsNullOrWhiteSpace(payload.End)) booking.End = payload.End!;
+    if (!string.IsNullOrWhiteSpace(payload.Status)) booking.Status = payload.Status!;
+    if (payload.DepositPaid.HasValue) booking.DepositPaid = payload.DepositPaid.Value;
+    if (payload.TotalPrice.HasValue) booking.TotalPrice = payload.TotalPrice;
+
+    await db.SaveChangesAsync(cancellationToken);
+
+    return Results.Ok(booking);
+}).RequireAuthorization();
 
 var pets = app.MapGroup("/pets").WithTags("Pets");
 
-pets.MapGet("", async (string? ownerId, PetHeroDbContext db) =>
+pets.MapGet("", async (
+    ClaimsPrincipal principal,
+    HttpRequest req,                    
+    string? ownerId,                     
+    PetHeroDbContext db,
+    CancellationToken cancellationToken) =>
 {
-    // 1:1 con mock json-server: /pets?ownerId=
-    var query = db.Pets.AsNoTracking().AsQueryable();
-    if (!string.IsNullOrWhiteSpace(ownerId))
+    var userId = ResolveUserId(principal);
+    if (userId is null) return Results.Unauthorized();
+
+    var role = ResolveUserRole(principal);
+    var userIdText = userId.Value.ToString();
+
+    if (string.Equals(role, "owner", StringComparison.OrdinalIgnoreCase))
     {
-        query = query.Where(p => p.OwnerId == ownerId);
+        var result = await db.Pets.AsNoTracking()
+            .Where(p => p.OwnerId == userIdText)
+            .ToListAsync(cancellationToken);
+
+        return Results.Ok(result);
     }
 
-    var list = await query.ToListAsync();
-    return Results.Ok(list);
-});
+    if (string.Equals(role, "guardian", StringComparison.OrdinalIgnoreCase))
+    {
+        return Results.Ok(new List<Pet>());
+    }
 
-pets.MapGet("/{id}", async (string id, PetHeroDbContext db) =>
+    return Results.Forbid();
+}).RequireAuthorization();
+
+
+pets.MapGet("/{id}", async (string id, ClaimsPrincipal principal, PetHeroDbContext db, CancellationToken cancellationToken) =>
 {
-    var entity = await db.Pets.AsNoTracking().FirstOrDefaultAsync(p => p.Id == id);
-    return entity is null ? Results.NotFound() : Results.Ok(entity);
-});
+    var userId = ResolveUserId(principal);
+    if (userId is null)
+    {
+        return Results.Unauthorized();
+    }
 
-pets.MapPost("", async (PetDto payload, PetHeroDbContext db) =>
+    var role = ResolveUserRole(principal);
+    var userIdText = userId.Value.ToString();
+
+    var pet = await db.Pets.AsNoTracking().FirstOrDefaultAsync(p => p.Id == id, cancellationToken);
+    if (pet is null)
+    {
+        return Results.NotFound();
+    }
+
+    if (string.Equals(role, "owner", StringComparison.OrdinalIgnoreCase))
+    {
+        if (!string.Equals(pet.OwnerId, userIdText, StringComparison.Ordinal))
+        {
+            return Results.Forbid();
+        }
+    }
+    else if (string.Equals(role, "guardian", StringComparison.OrdinalIgnoreCase))
+    {
+        var hasBooking = await db.Bookings.AsNoTracking()
+            .AnyAsync(b => b.PetId == pet.Id && b.GuardianId == userIdText, cancellationToken);
+        if (!hasBooking)
+        {
+            return Results.Forbid();
+        }
+    }
+    else
+    {
+        return Results.Forbid();
+    }
+
+    return Results.Ok(pet);
+}).RequireAuthorization();
+
+pets.MapPost("", async (PetDto payload, ClaimsPrincipal principal, PetHeroDbContext db, CancellationToken cancellationToken) =>
 {
     if (payload is null)
     {
@@ -531,11 +883,24 @@ pets.MapPost("", async (PetDto payload, PetHeroDbContext db) =>
         return Results.BadRequest(new { message = "ownerId, name, type and size are required" });
     }
 
-    var id = string.IsNullOrWhiteSpace(payload.Id) ? Guid.NewGuid().ToString() : payload.Id!;
-
-    var entity = new Pet
+    var userId = ResolveUserId(principal);
+    if (userId is null)
     {
-        Id = id,
+        return Results.Unauthorized();
+    }
+
+    var role = ResolveUserRole(principal);
+    var userIdText = userId.Value.ToString();
+
+    if (!string.Equals(role, "owner", StringComparison.OrdinalIgnoreCase) ||
+        !string.Equals(payload.OwnerId, userIdText, StringComparison.Ordinal))
+    {
+        return Results.Forbid();
+    }
+
+    var pet = new Pet
+    {
+        Id = Guid.NewGuid().ToString(),
         OwnerId = payload.OwnerId!,
         Name = payload.Name!,
         Type = payload.Type!,
@@ -546,25 +911,43 @@ pets.MapPost("", async (PetDto payload, PetHeroDbContext db) =>
         Notes = payload.Notes
     };
 
-    db.Pets.Add(entity);
-    await db.SaveChangesAsync();
+    db.Pets.Add(pet);
+    await db.SaveChangesAsync(cancellationToken);
 
-    return Results.Created($"/pets/{entity.Id}", entity);
-});
+    return Results.Created($"/pets/{pet.Id}", pet);
+}).RequireAuthorization();
 
-pets.MapDelete("/{id}", async (string id, PetHeroDbContext db) =>
+pets.MapDelete("/{id}", async (string id, ClaimsPrincipal principal, PetHeroDbContext db, CancellationToken cancellationToken) =>
 {
-    var entity = await db.Pets.FirstOrDefaultAsync(p => p.Id == id);
-    if (entity is null)
+    var userId = ResolveUserId(principal);
+    if (userId is null)
+    {
+        return Results.Unauthorized();
+    }
+
+    var role = ResolveUserRole(principal);
+    if (!string.Equals(role, "owner", StringComparison.OrdinalIgnoreCase))
+    {
+        return Results.Forbid();
+    }
+
+    var userIdText = userId.Value.ToString();
+    var pet = await db.Pets.FirstOrDefaultAsync(p => p.Id == id, cancellationToken);
+    if (pet is null)
     {
         return Results.NotFound();
     }
 
-    db.Pets.Remove(entity);
-    await db.SaveChangesAsync();
+    if (!string.Equals(pet.OwnerId, userIdText, StringComparison.Ordinal))
+    {
+        return Results.Forbid();
+    }
+
+    db.Pets.Remove(pet);
+    await db.SaveChangesAsync(cancellationToken);
 
     return Results.NoContent();
-});
+}).RequireAuthorization();
 
 var favorites = app.MapGroup("/favorites").WithTags("Favorites");
 
@@ -786,26 +1169,69 @@ messages.MapPost("", async (MessageDto payload, PetHeroDbContext db) =>
 
 var vouchers = app.MapGroup("/paymentVouchers").WithTags("PaymentVouchers");
 
-vouchers.MapGet("", async (string? bookingId, PetHeroDbContext db) =>
+vouchers.MapGet("", async (ClaimsPrincipal principal, string? bookingId, PetHeroDbContext db, CancellationToken cancellationToken) =>
 {
-    // 1:1 con mock json-server: /paymentVouchers?bookingId=
+    var userId = ResolveUserId(principal);
+    if (userId is null)
+    {
+        return Results.Unauthorized();
+    }
+
+    var role = ResolveUserRole(principal);
+    if (string.IsNullOrWhiteSpace(role))
+    {
+        return Results.Forbid();
+    }
+
     var query = db.PaymentVouchers.AsNoTracking().AsQueryable();
+
     if (!string.IsNullOrWhiteSpace(bookingId))
     {
         query = query.Where(v => v.BookingId == bookingId);
     }
 
-    var list = await query.ToListAsync();
-    return Results.Ok(list);
-});
+    var vouchers = await query.ToListAsync(cancellationToken);
+    if (vouchers.Count == 0)
+    {
+        return Results.Ok(vouchers);
+    }
 
-vouchers.MapGet("/{id}", async (string id, PetHeroDbContext db) =>
+    var bookingIds = vouchers.Select(v => v.BookingId).Distinct().ToList();
+    var bookings = await db.Bookings.AsNoTracking()
+        .Where(b => bookingIds.Contains(b.Id))
+        .ToDictionaryAsync(b => b.Id, cancellationToken);
+
+    var filtered = vouchers.Where(v =>
+        bookings.TryGetValue(v.BookingId, out var booking) &&
+        IsBookingAccessible(booking, userId.Value, role)).ToList();
+
+    return Results.Ok(filtered);
+}).RequireAuthorization();
+
+vouchers.MapGet("/{id}", async (string id, ClaimsPrincipal principal, PetHeroDbContext db, CancellationToken cancellationToken) =>
 {
-    var entity = await db.PaymentVouchers.AsNoTracking().FirstOrDefaultAsync(v => v.Id == id);
-    return entity is null ? Results.NotFound() : Results.Ok(entity);
-});
+    var userId = ResolveUserId(principal);
+    if (userId is null)
+    {
+        return Results.Unauthorized();
+    }
 
-vouchers.MapPost("", async (PaymentVoucherDto payload, PetHeroDbContext db) =>
+    var voucher = await db.PaymentVouchers.AsNoTracking().FirstOrDefaultAsync(v => v.Id == id, cancellationToken);
+    if (voucher is null)
+    {
+        return Results.NotFound();
+    }
+
+    var booking = await db.Bookings.AsNoTracking().FirstOrDefaultAsync(b => b.Id == voucher.BookingId, cancellationToken);
+    if (booking is null || !IsBookingAccessible(booking, userId.Value, ResolveUserRole(principal)))
+    {
+        return Results.Forbid();
+    }
+
+    return Results.Ok(voucher);
+}).RequireAuthorization();
+
+vouchers.MapPost("", async (PaymentVoucherDto payload, ClaimsPrincipal principal, PetHeroDbContext db, CancellationToken cancellationToken) =>
 {
     if (payload is null)
     {
@@ -820,47 +1246,88 @@ vouchers.MapPost("", async (PaymentVoucherDto payload, PetHeroDbContext db) =>
         return Results.BadRequest(new { message = "bookingId, amount, dueDate and status are required" });
     }
 
-    var id = string.IsNullOrWhiteSpace(payload.Id) ? Guid.NewGuid().ToString() : payload.Id!;
-    var exists = await db.PaymentVouchers.AnyAsync(v => v.Id == id);
-    if (exists)
+    var userId = ResolveUserId(principal);
+    if (userId is null)
     {
-        return Results.Conflict(new { message = "Voucher already exists" });
+        return Results.Unauthorized();
     }
 
-    var entity = new PaymentVoucher
+    var booking = await db.Bookings.FirstOrDefaultAsync(b => b.Id == payload.BookingId, cancellationToken);
+    if (booking is null)
     {
-        Id = id,
+        return Results.BadRequest(new { message = "Booking not found" });
+    }
+
+    if (!IsBookingAccessible(booking, userId.Value, ResolveUserRole(principal)))
+    {
+        return Results.Forbid();
+    }
+
+    var voucher = new PaymentVoucher
+    {
+        Id = Guid.NewGuid().ToString(),
         BookingId = payload.BookingId!,
         Amount = payload.Amount.Value,
         DueDate = payload.DueDate!,
         Status = payload.Status!,
-        CreatedAt = string.IsNullOrWhiteSpace(payload.CreatedAt) ? DateTime.UtcNow.ToString("o") : payload.CreatedAt
+        CreatedAt = DateTime.UtcNow.ToString("o")
     };
 
-    db.PaymentVouchers.Add(entity);
-    await db.SaveChangesAsync();
+    db.PaymentVouchers.Add(voucher);
+    await db.SaveChangesAsync(cancellationToken);
 
-    return Results.Created($"/paymentVouchers/{entity.Id}", entity);
-});
+    return Results.Created($"/paymentVouchers/{voucher.Id}", voucher);
+}).RequireAuthorization();
 
-vouchers.MapPut("/{id}", async (string id, PaymentVoucherDto payload, PetHeroDbContext db) =>
+vouchers.MapPut("/{id}", async (string id, PaymentVoucherDto payload, ClaimsPrincipal principal, PetHeroDbContext db, CancellationToken cancellationToken) =>
 {
-    var entity = await db.PaymentVouchers.FirstOrDefaultAsync(v => v.Id == id);
-    if (entity is null)
+    if (payload is null)
+    {
+        return Results.BadRequest(new { message = "Invalid body" });
+    }
+
+    var userId = ResolveUserId(principal);
+    if (userId is null)
+    {
+        return Results.Unauthorized();
+    }
+
+    var voucher = await db.PaymentVouchers.FirstOrDefaultAsync(v => v.Id == id, cancellationToken);
+    if (voucher is null)
     {
         return Results.NotFound();
     }
 
-    if (!string.IsNullOrWhiteSpace(payload.BookingId)) entity.BookingId = payload.BookingId!;
-    if (payload.Amount.HasValue) entity.Amount = payload.Amount.Value;
-    if (!string.IsNullOrWhiteSpace(payload.DueDate)) entity.DueDate = payload.DueDate!;
-    if (!string.IsNullOrWhiteSpace(payload.Status)) entity.Status = payload.Status!;
-    if (!string.IsNullOrWhiteSpace(payload.CreatedAt)) entity.CreatedAt = payload.CreatedAt;
+    var booking = await db.Bookings.FirstOrDefaultAsync(b => b.Id == voucher.BookingId, cancellationToken);
+    if (booking is null || !IsBookingAccessible(booking, userId.Value, ResolveUserRole(principal)))
+    {
+        return Results.Forbid();
+    }
 
-    await db.SaveChangesAsync();
+    if (!string.IsNullOrWhiteSpace(payload.BookingId) && !string.Equals(payload.BookingId, voucher.BookingId, StringComparison.Ordinal))
+    {
+        return Results.BadRequest(new { message = "bookingId cannot be changed" });
+    }
 
-    return Results.Ok(entity);
-});
+    if (payload.Amount.HasValue)
+    {
+        voucher.Amount = payload.Amount.Value;
+    }
+
+    if (!string.IsNullOrWhiteSpace(payload.DueDate))
+    {
+        voucher.DueDate = payload.DueDate!;
+    }
+
+    if (!string.IsNullOrWhiteSpace(payload.Status))
+    {
+        voucher.Status = payload.Status!;
+    }
+
+    await db.SaveChangesAsync(cancellationToken);
+
+    return Results.Ok(voucher);
+}).RequireAuthorization();
 
 var payments = app.MapGroup("/payments").WithTags("Payments");
 
@@ -897,4 +1364,90 @@ payments.MapPost("", async (PaymentDto payload, PetHeroDbContext db) =>
     return Results.Created($"/payments/{entity.Id}", entity);
 });
 
+
+static int? ResolveUserId(ClaimsPrincipal principal)
+{
+    var idValue = principal.FindFirstValue(ClaimTypes.NameIdentifier) ?? principal.FindFirstValue(JwtRegisteredClaimNames.Sub);
+    return int.TryParse(idValue, out var id) ? id : null;
+}
+
+static string? ResolveUserRole(ClaimsPrincipal principal)
+{
+    return principal.FindFirstValue(ClaimTypes.Role);
+}
+
+static bool IsBookingAccessible(Booking booking, int userId, string? role)
+{
+    var userIdText = userId.ToString();
+
+    if (string.Equals(role, "owner", StringComparison.OrdinalIgnoreCase))
+    {
+        return string.Equals(booking.OwnerId, userIdText, StringComparison.Ordinal);
+    }
+
+    if (string.Equals(role, "guardian", StringComparison.OrdinalIgnoreCase))
+    {
+        return string.Equals(booking.GuardianId, userIdText, StringComparison.Ordinal);
+    }
+
+    return false;
+}
+
+static async Task<AuthenticatedUserDto> BuildAuthenticatedUserDtoAsync(User user, PetHeroDbContext db, CancellationToken cancellationToken = default)
+{
+    ProfileSummaryDto? profileDto = null;
+
+    if (user.ProfileId.HasValue)
+    {
+        var profile = await db.Profiles.AsNoTracking().FirstOrDefaultAsync(p => p.Id == user.ProfileId.Value, cancellationToken);
+        if (profile is null)
+        {
+            profile = await db.Profiles.AsNoTracking().FirstOrDefaultAsync(p => p.UserId == user.Id, cancellationToken);
+        }
+
+        if (profile is not null)
+        {
+            profileDto = new ProfileSummaryDto
+            {
+                Id = profile.Id,
+                DisplayName = profile.DisplayName,
+                Phone = profile.Phone,
+                Location = profile.Location,
+                Bio = profile.Bio,
+                AvatarUrl = profile.AvatarUrl
+            };
+        }
+    }
+    else
+    {
+        var profile = await db.Profiles.AsNoTracking().FirstOrDefaultAsync(p => p.UserId == user.Id, cancellationToken);
+        if (profile is not null)
+        {
+            profileDto = new ProfileSummaryDto
+            {
+                Id = profile.Id,
+                DisplayName = profile.DisplayName,
+                Phone = profile.Phone,
+                Location = profile.Location,
+                Bio = profile.Bio,
+                AvatarUrl = profile.AvatarUrl
+            };
+        }
+    }
+
+    return new AuthenticatedUserDto
+    {
+        Id = user.Id,
+        Email = user.Email,
+        Role = user.Role,
+        ProfileId = profileDto?.Id ?? user.ProfileId,
+        Profile = profileDto
+    };
+}
+
 await app.RunAsync();
+
+
+
+
+

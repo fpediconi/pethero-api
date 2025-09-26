@@ -23,6 +23,7 @@ public static class SeedData
             Email = "owner@pethero.test",
             Password = "owner123",
             Role = "owner",
+            IsLoggedIn = false,
             CreatedAt = now.ToString("o")
         };
 
@@ -32,6 +33,7 @@ public static class SeedData
             Email = "guardian@pethero.test",
             Password = "guardian123",
             Role = "guardian",
+            IsLoggedIn = false,
             CreatedAt = now.ToString("o")
         };
 
@@ -62,7 +64,7 @@ public static class SeedData
 
         var guardian = new Guardian
         {
-            Id = "g1",
+            Id = guardianUser.Id.ToString(),
             Name = guardianProfile.DisplayName,
             Bio = guardianProfile.Bio,
             AvatarUrl = guardianProfile.AvatarUrl,
@@ -87,7 +89,7 @@ public static class SeedData
         var pet = new Pet
         {
             Id = "pet-1",
-            OwnerId = $"u{owner.Id}",
+            OwnerId = owner.Id.ToString(),
             Name = "Luna",
             Type = "DOG",
             Breed = "Mestiza",
@@ -114,7 +116,7 @@ public static class SeedData
         var favorite = new Favorite
         {
             Id = Guid.NewGuid().ToString(),
-            OwnerId = $"u{owner.Id}",
+            OwnerId = owner.Id.ToString(),
             GuardianId = guardian.Id,
             CreatedAt = now.ToString("o")
         };
@@ -176,3 +178,4 @@ public static class SeedData
         await db.SaveChangesAsync(cancellationToken);
     }
 }
+

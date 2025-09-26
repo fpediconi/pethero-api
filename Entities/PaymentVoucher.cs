@@ -9,5 +9,8 @@ public class PaymentVoucher
     public decimal Amount { get; set; }
     public required string DueDate { get; set; }
     public required string Status { get; set; }
-    public string? CreatedAt { get; set; }
+    public string CreatedAt { get; set; } = DateTime.UtcNow.ToString("o");
 }
+
+
+
